@@ -2936,7 +2936,7 @@ impl Payroll {
     /// system can also cancel a pending run while paused, enabling rapid
     pub fn cancel_payroll_run_with_reason(e: Env, admin: Address, run_id: u64, reason: Symbol) {
         Self::validate_run_id(run_id);
-        Self::validate_symbol_not_empty(&e, &reason, "reason");
+        Payroll::validate_symbol_not_empty(&e, &reason, "reason");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -3532,7 +3532,7 @@ impl Payroll {
         period_label: Symbol,
     ) -> u64 {
         Self::require_not_paused(&e);
-        Self::validate_symbol_not_empty(&e, &period_label, "period_label");
+        Payroll::validate_symbol_not_empty(&e, &period_label, "period_label");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -4522,7 +4522,7 @@ impl Payroll {
             panic!("Unauthorized");
         }
         admin.require_auth();
-        Self::validate_symbol_not_empty(&e, &period, "period");
+        Payroll::validate_symbol_not_empty(&e, &period, "period");
 
         e.storage()
             .persistent()
@@ -4653,7 +4653,7 @@ impl Payroll {
         }
         admin.require_auth();
 
-        Self::validate_symbol_not_empty(&e, &period, "period");
+        Payroll::validate_symbol_not_empty(&e, &period, "period");
 
         // Issue #248: reject edits to a period whose configuration is frozen.
         Self::assert_period_config_editable(&e, &period);
@@ -4751,7 +4751,7 @@ impl Payroll {
         }
         admin.require_auth();
 
-        Self::validate_symbol_not_empty(&e, &period, "period");
+        Payroll::validate_symbol_not_empty(&e, &period, "period");
 
         let frozen_key = DataKey::PeriodConfigFrozen(period.clone());
         let previous_ref = stored_ref(&e, &frozen_key);
@@ -4769,7 +4769,7 @@ impl Payroll {
     /// Return the recorded freeze state for a period.
     ///
     /// This reflects only the explicit freeze marker. Use
-    /// [`is_period_config_frozen`](Self::is_period_config_frozen) to also
+    /// [`is_period_config_frozen`](Payroll::is_period_config_frozen) to also
     /// account for the implicit conditions (submitted run, settlement-ready)
     /// that block configuration edits.
     pub fn get_period_config_state(e: Env, period: Symbol) -> PeriodConfigState {
@@ -4816,7 +4816,7 @@ impl Payroll {
 
     /// Panic when a period's configuration is frozen and must not be edited.
     fn assert_period_config_editable(e: &Env, period: &Symbol) {
-        if Self::is_period_config_frozen(e.clone(), period.clone()) {
+        if Payroll::is_period_config_frozen(e.clone(), period.clone()) {
             panic!(
                 "Payroll period configuration is frozen: settlement window cannot be edited (error code {})",
                 PaymentError::InvalidSettlementWindowConfig as u32
@@ -5350,9 +5350,9 @@ impl Payroll {
         reason: Symbol,
     ) -> u64 {
         Self::validate_run_id(run_id);
-        Self::validate_symbol_not_empty(&e, &period, "period");
+        Payroll::validate_symbol_not_empty(&e, &period, "period");
         Self::validate_non_zero_digest(&e, &batch_root, "batch_root");
-        Self::validate_symbol_not_empty(&e, &reason, "reason");
+        Payroll::validate_symbol_not_empty(&e, &reason, "reason");
         Self::require_dispute_authority(&e, &caller);
         caller.require_auth();
 
@@ -5420,7 +5420,7 @@ impl Payroll {
     /// dispute. Once resolved, the associated run is no longer frozen and
     /// normal lifecycle actions (finalize, archive, prune) may continue.
     pub fn resolve_dispute(e: Env, caller: Address, dispute_id: u64, resolution_reason: Symbol) {
-        Self::validate_symbol_not_empty(&e, &resolution_reason, "resolution_reason");
+        Payroll::validate_symbol_not_empty(&e, &resolution_reason, "resolution_reason");
         Self::require_dispute_authority(&e, &caller);
         caller.require_auth();
 
@@ -10474,10 +10474,10 @@ mod tests {
     /// Returns Ok(()) if valid, panics with actionable message otherwise.
     /// Privacy-safe: does not expose salary amounts or employee data.
     pub fn validate_period_for_cloning(e: Env, period: Symbol) -> Result<(), ()> {
-        Self::validate_symbol_not_empty(&e, &period, "period");
+        Payroll::validate_symbol_not_empty(&e, &period, "period");
         
         // Check if period is frozen
-        if Self::is_period_config_frozen(e.clone(), period.clone()) {
+        if Payroll::is_period_config_frozen(e.clone(), period.clone()) {
             panic!("Source period is frozen and cannot be used as a template");
         }
         
