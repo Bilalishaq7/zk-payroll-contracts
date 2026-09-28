@@ -6351,24 +6351,6 @@ impl Payroll {
     /// - If the batch is in a pending run state (`PendingRun(run_id)`), its `prepared_at` timestamp is returned.
     /// - If the batch has been executed (`PayrollRun(run_id)`), its `executed_at` timestamp is returned.
     /// - If the batch does not exist or has not been locked, `None` is returned.
-    pub fn get_batch_lock_timestamp(e: Env, run_id: u64) -> Option<u64> {
-        if let Some(pending) = e
-            .storage()
-            .persistent()
-            .get::<_, PendingPayrollRun>(&DataKey::PendingRun(run_id))
-        {
-            return Some(pending.prepared_at);
-        }
-        if let Some(run) = e
-            .storage()
-            .persistent()
-            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
-        {
-            return Some(run.executed_at);
-        }
-        None
-    }
-
     // ?? Issue #402: Safe Treasury Balance Summary View ???????????????????????
 
     /// Return aggregate treasury balance summary for a given asset token (#402).
@@ -6376,57 +6358,16 @@ impl Payroll {
     /// Returns the total balance held at the treasury address, the reserved/locked
     /// balance allocated to pending payroll runs, blocked balances, and the net
     /// available balance without disclosing individual salary rows.
-    pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
-        let addrs: ContractAddresses = e
-            .storage()
-            .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
-        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
-        let blocked_balance = 0i128;
-        let available_balance = total_balance
-            .checked_sub(reserved_balance)
-            .unwrap_or(0i128)
-            .checked_sub(blocked_balance)
-            .unwrap_or(0i128);
-
-        SafeTreasurySummary {
-            asset,
-            total_balance,
-            available_balance,
-            reserved_balance,
-            blocked_balance,
-        }
-    }
-
     // ?? Issue #403: Payroll Approval Expiry Validation ???????????????????????
 
     /// Check whether an approval for a payroll run has expired (#403).
     ///
     /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
     /// Returns `false` if the approval is within the validity window or if no approval exists.
-    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
-        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
-            if review.decision == ReviewDecision::Approved {
-                let current_time = e.ledger().timestamp();
-                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
-                return current_time > expiry_time;
-            }
-        }
-        false
-    }
-
     /// Validate that a payroll run approval is active and not expired (#403).
     ///
     /// # Panics
     /// - If the approval for `run_id` has expired (older than `max_age_seconds`).
-    pub fn validate_approval_not_expired(e: &Env, run_id: u64, max_age_seconds: u64) {
-        if Self::is_payroll_approval_expired(e.clone(), run_id, max_age_seconds) {
-            panic!("Payroll approval expired: approval record exceeds maximum allowed age");
-        }
-    }
-
     // ?? Issue #404: Cancelled Batch Read Status Helper ???????????????????????
 
     /// Read safe cancellation metadata for a cancelled payroll batch (#404).
@@ -6435,94 +6376,13 @@ impl Payroll {
     /// run_id, cancellation timestamp, admin address, cancellation reason symbol,
     /// employee count, total amount, draft hash, and `is_cancelled: true`.
     /// Returns `None` if the batch was not cancelled or does not exist.
-    pub fn get_cancelled_batch_status(e: Env, run_id: u64) -> Option<CancelledBatchStatus> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::CancelledBatchRecord(run_id))
-    }
-
     // ?? Issue #352: Payroll Batch Split Validation ??????????????????????????????????
 
     /// Record a batch split to track parent-child relationships (#352).
     /// Validates that child batch totals can be aggregated back to parent.
-    pub fn record_batch_split(
-        e: Env,
-        admin: Address,
-        parent_run_id: u64,
-        child_run_id: u64,
-        parent_total: i128,
-        parent_employee_count: u32,
-        child_total: i128,
-        child_employee_count: u32,
-    ) {
-        admin.require_auth();
-
-        if child_total <= 0 || parent_total <= 0 {
-            panic!("Batch amounts must be positive");
-        }
-
-        if child_total > parent_total {
-            panic!("Child batch total cannot exceed parent total");
-        }
-
-        if child_employee_count > parent_employee_count {
-            panic!("Child employee count cannot exceed parent count");
-        }
-
-        let split_record = BatchSplitRecord {
-            parent_run_id,
-            child_run_id,
-            parent_total,
-            parent_employee_count,
-            child_total,
-            child_employee_count,
-            split_at: e.ledger().timestamp(),
-            split_by: admin.clone(),
-        };
-
-        e.storage().persistent().set(
-            &DataKey::BatchSplitRecord(parent_run_id, child_run_id),
-            &split_record,
-        );
-
-        e.events().publish(
-            (Symbol::new(&e, "BatchSplitRecorded"), parent_run_id),
-            (child_run_id, child_total, e.ledger().timestamp()),
-        );
-    }
-
     /// Get batch split record by parent and child run IDs (#352).
-    pub fn get_batch_split(
-        e: Env,
-        parent_run_id: u64,
-        child_run_id: u64,
-    ) -> Option<BatchSplitRecord> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
-    }
-
     /// Validate that a batch split preserves the original aggregate commitment (#352).
     /// This ensures that when a large batch is split, the sum of children equals the parent.
-    pub fn validate_batch_split_aggregate(
-        e: Env,
-        parent_run_id: u64,
-        expected_total_amount: i128,
-        expected_employee_count: u32,
-    ) -> bool {
-        let parent_run_key = DataKey::PayrollRun(parent_run_id);
-        if let Some(parent_run) = e
-            .storage()
-            .persistent()
-            .get::<DataKey, PayrollRun>(&parent_run_key)
-        {
-            parent_run.total_amount == expected_total_amount
-                && parent_run.employee_count == expected_employee_count
-        } else {
-            false
-        }
-    }
-
     // ?? Issue #401: Batch Lock Timestamp Query Helper ????????????????????????
 
     /// Return the timestamp at which a payroll batch reached locked state (#401).
@@ -6532,24 +6392,6 @@ impl Payroll {
     /// - If the batch is in a pending run state (`PendingRun(run_id)`), its `prepared_at` timestamp is returned.
     /// - If the batch has been executed (`PayrollRun(run_id)`), its `executed_at` timestamp is returned.
     /// - If the batch does not exist or has not been locked, `None` is returned.
-    pub fn get_batch_lock_timestamp(e: Env, run_id: u64) -> Option<u64> {
-        if let Some(pending) = e
-            .storage()
-            .persistent()
-            .get::<_, PendingPayrollRun>(&DataKey::PendingRun(run_id))
-        {
-            return Some(pending.prepared_at);
-        }
-        if let Some(run) = e
-            .storage()
-            .persistent()
-            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
-        {
-            return Some(run.executed_at);
-        }
-        None
-    }
-
     // ?? Issue #402: Safe Treasury Balance Summary View ???????????????????????
 
     /// Return aggregate treasury balance summary for a given asset token (#402).
@@ -6557,57 +6399,16 @@ impl Payroll {
     /// Returns the total balance held at the treasury address, the reserved/locked
     /// balance allocated to pending payroll runs, blocked balances, and the net
     /// available balance without disclosing individual salary rows.
-    pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
-        let addrs: ContractAddresses = e
-            .storage()
-            .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
-        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
-        let blocked_balance = 0i128;
-        let available_balance = total_balance
-            .checked_sub(reserved_balance)
-            .unwrap_or(0i128)
-            .checked_sub(blocked_balance)
-            .unwrap_or(0i128);
-
-        SafeTreasurySummary {
-            asset,
-            total_balance,
-            available_balance,
-            reserved_balance,
-            blocked_balance,
-        }
-    }
-
     // ?? Issue #403: Payroll Approval Expiry Validation ???????????????????????
 
     /// Check whether an approval for a payroll run has expired (#403).
     ///
     /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
     /// Returns `false` if the approval is within the validity window or if no approval exists.
-    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
-        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
-            if review.decision == ReviewDecision::Approved {
-                let current_time = e.ledger().timestamp();
-                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
-                return current_time > expiry_time;
-            }
-        }
-        false
-    }
-
     /// Validate that a payroll run approval is active and not expired (#403).
     ///
     /// # Panics
     /// - If the approval for `run_id` has expired (older than `max_age_seconds`).
-    pub fn validate_approval_not_expired(e: &Env, run_id: u64, max_age_seconds: u64) {
-        if Self::is_payroll_approval_expired(e.clone(), run_id, max_age_seconds) {
-            panic!("Payroll approval expired: approval record exceeds maximum allowed age");
-        }
-    }
-
     // ?? Issue #404: Cancelled Batch Read Status Helper ???????????????????????
 
     /// Read safe cancellation metadata for a cancelled payroll batch (#404).
@@ -6616,94 +6417,14 @@ impl Payroll {
     /// run_id, cancellation timestamp, admin address, cancellation reason symbol,
     /// employee count, total amount, draft hash, and `is_cancelled: true`.
     /// Returns `None` if the batch was not cancelled or does not exist.
-    pub fn get_cancelled_batch_status(e: Env, run_id: u64) -> Option<CancelledBatchStatus> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::CancelledBatchRecord(run_id))
-    }
-
     // ?? Issue #352: Payroll Batch Split Validation ??????????????????????????????????
 
     /// Record a batch split to track parent-child relationships (#352).
     /// Validates that child batch totals can be aggregated back to parent.
-    pub fn record_batch_split(
-        e: Env,
-        admin: Address,
-        parent_run_id: u64,
-        child_run_id: u64,
-        parent_total: i128,
-        parent_employee_count: u32,
-        child_total: i128,
-        child_employee_count: u32,
-    ) {
-        admin.require_auth();
-
-        if child_total <= 0 || parent_total <= 0 {
-            panic!("Batch amounts must be positive");
-        }
-
-        if child_total > parent_total {
-            panic!("Child batch total cannot exceed parent total");
-        }
-
-        if child_employee_count > parent_employee_count {
-            panic!("Child employee count cannot exceed parent count");
-        }
-
-        let split_record = BatchSplitRecord {
-            parent_run_id,
-            child_run_id,
-            parent_total,
-            parent_employee_count,
-            child_total,
-            child_employee_count,
-            split_at: e.ledger().timestamp(),
-            split_by: admin.clone(),
-        };
-
-        e.storage().persistent().set(
-            &DataKey::BatchSplitRecord(parent_run_id, child_run_id),
-            &split_record,
-        );
-
-        e.events().publish(
-            (Symbol::new(&e, "BatchSplitRecorded"), parent_run_id),
-            (child_run_id, child_total, e.ledger().timestamp()),
-        );
-    }
-
     /// Get batch split record by parent and child run IDs (#352).
-    pub fn get_batch_split(
-        e: Env,
-        parent_run_id: u64,
-        child_run_id: u64,
-    ) -> Option<BatchSplitRecord> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
-    }
-
     /// Validate that a batch split preserves the original aggregate commitment (#352).
     /// This ensures that when a large batch is split, the sum of children equals the parent.
-    pub fn validate_batch_split_aggregate(
-        e: Env,
-        parent_run_id: u64,
-        expected_total_amount: i128,
-        expected_employee_count: u32,
-    ) -> bool {
-        let parent_run_key = DataKey::PayrollRun(parent_run_id);
-        if let Some(parent_run) = e
-            .storage()
-            .persistent()
-            .get::<DataKey, PayrollRun>(&parent_run_key)
-        {
-            parent_run.total_amount == expected_total_amount
-                && parent_run.employee_count == expected_employee_count
-        } else {
-            false
-        }
     }
-}
 
 #[cfg(test)]
 mod tests {
