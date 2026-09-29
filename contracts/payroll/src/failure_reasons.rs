@@ -91,6 +91,10 @@ pub enum PayrollFailureReason {
     /// The contract period transition is not allowed from the current
     /// period state.
     ContractPeriodTransitionInvalid = 22,
+    /// An approval threshold is configured, so direct execution is
+    /// unavailable: use `prepare_payroll_run`, collect reviewer approvals,
+    /// then `finalize_payroll_run`.
+    ApprovalWorkflowRequired = 23,
 }
 
 /// Result of a dry-run preflight check for `batch_process_payroll`.
@@ -128,7 +132,7 @@ impl PayrollDryRunReport {
         }
     }
 
-    pub(crate) fn push&mut self, reason: PayrollFailureReason) {
+    pub(crate) fn push(&mut self, reason: PayrollFailureReason) {
         self.blockers.push_back(reason);
         self.would_succeed = false;
     }

@@ -10,6 +10,9 @@ use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 use shared_errors::{AuthError, PaymentError, TreasuryError};
 
+pub mod approvals;
+pub use approvals::{ApprovalProgress, RunApproval, MAX_APPROVAL_THRESHOLD, MAX_RUN_APPROVALS};
+
 pub mod config_audit;
 use config_audit::{config_keys, no_value_ref, record_config_change, stored_ref, value_ref};
 
@@ -34,14 +37,6 @@ use import_source::{require_authorized_source, validate_source_for_report};
 
 const MAX_BATCH: u32 = 50;
 const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
-
-/// Storage key for the duplicate-execution guard on payroll runs.
-///
-/// Maps a caller-supplied idempotency key to the run it produced so a
-/// repeated submission with the same key is rejected instead of executing
-/// payroll twice. The stored record contains only the run id and a payload
-/// hash, never salary values or employee identities.
-const EXECUTION_GUARD_KEY: Symbol = symbol_short!("exec_guard");
 
 #[contract]
 pub struct Payroll;
@@ -592,26 +587,6 @@ pub enum PeriodConfigState {
     Editable = 0,
     /// Configuration is locked and must not change.
     Frozen = 1,
-}
-
-/// Audit record captured when a period is frozen at draft submission (#471).
-///
-/// Privacy-safe: carries only the period label, the authorizing admin, a
-/// short reason symbol, and the number of associated runs — never salary
-/// values or employee data.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct PeriodFreeze {
-    /// The period that was frozen.
-    pub period_label: Symbol,
-    /// Admin that authorized the freeze (or the auto-freeze actor).
-    pub frozen_by: Address,
-    /// Ledger timestamp of the freeze.
-    pub frozen_at: u64,
-    /// Short human-readable reason for the freeze.
-    pub reason: Symbol,
-    /// Number of finalized runs associated with the period at freeze time.
-    pub runs_count: u32,
 }
 
 // ── Issue #482: Duplicate employee entry validation ──────────────────
@@ -1217,6 +1192,13 @@ pub enum DataKey {
     /// SHA-256'd XDR encoding) as already consumed, preventing replay of
     /// the exact same signed payload (#519).
     ConsumedOperatorAuth(BytesN<32>),
+    /// Number of distinct live reviewer approvals `finalize_payroll_run`
+    /// requires. Absent means no threshold, matching the pre-existing
+    /// single-review workflow.
+    ApprovalThreshold,
+    /// Reviewer approvals recorded for a payroll run, counted against
+    /// `ApprovalThreshold` at finalization.
+    RunApprovals(u64),
     /// Organization policy version applied to this contract (#553).
     /// Absent means no policy has been applied yet.
     OrganizationPolicyVersion,
@@ -3855,6 +3837,7 @@ impl Payroll {
 
         // Validate approval expiry if a review exists (#403)
         Self::validate_approval_not_expired(&e, run_id, DEFAULT_APPROVAL_EXPIRY_SECONDS);
+        approvals::require_threshold_met(&e, run_id);
 
         // Issue #218: Check if run has already been finalized
         // Once a run is executed, it cannot be cancelled
@@ -4118,6 +4101,7 @@ impl Payroll {
         // Issue #620: authorize the execution initiator before any other work.
         Self::require_execution_initiator(&e);
         Self::require_company_active(&e);
+        approvals::require_no_threshold_for_direct_execution(&e);
 
         // Validate import source authorization before any other work.
         require_authorized_source(&e, &source_address);
@@ -4361,6 +4345,7 @@ impl Payroll {
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
         Self::require_company_active(&e);
+        approvals::require_no_threshold_for_direct_execution(&e);
 
         Self::validate_storage_version_for_operation(&e, "batch_process_with_expiry");
 
@@ -4567,6 +4552,9 @@ impl Payroll {
 
         if !Self::company_is_active(&e) {
             report.push(PayrollFailureReason::CompanyNotActive);
+        }
+        if approvals::threshold(&e).is_some() {
+            report.push(PayrollFailureReason::ApprovalWorkflowRequired);
         }
 
         // Validate import source
@@ -4817,6 +4805,7 @@ impl Payroll {
         // Issue #620: authorize the execution initiator before any other work.
         Self::require_execution_initiator(&e);
         Self::require_company_active(&e);
+        approvals::require_no_threshold_for_direct_execution(&e);
 
         Self::validate_storage_version_for_operation(&e, "batch_process_payroll_bounded");
 
@@ -7504,6 +7493,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PayrollState(run_id));
         e.storage().persistent().remove(&DataKey::RunReview(run_id));
+        approvals::clear_approvals(&e, run_id);
 
         payroll_events::emit_run_pruned(&e, run_id, admin.clone());
         payroll_events::emit_retention_pruned(&e, Symbol::new(&e, "finalized_run"), run_id, admin);
@@ -7540,6 +7530,7 @@ impl Payroll {
         e.storage()
             .persistent()
             .remove(&DataKey::PayrollState(run_id));
+        approvals::clear_approvals(&e, run_id);
         payroll_events::emit_retention_pruned(
             &e,
             Symbol::new(&e, "cancelled_batch"),
@@ -7944,6 +7935,102 @@ impl Payroll {
             .unwrap_or(0)
     }
 
+    // ── Configurable payroll approval threshold ──────────────────────────────
+
+    /// Require `threshold` distinct, live reviewer approvals before
+    /// `finalize_payroll_run` may execute a prepared run. Only the admin may
+    /// call. While a threshold is configured, the direct execution
+    /// entrypoints (`batch_process_payroll*`) are unavailable.
+    ///
+    /// Rejected when `threshold` is zero (use `clear_approval_threshold`),
+    /// exceeds `MAX_APPROVAL_THRESHOLD`, or exceeds the number of currently
+    /// authorized reviewers (an unreachable threshold would block payroll).
+    /// Locked while any payroll run is pending, so the bar cannot move under
+    /// an in-flight run.
+    pub fn set_approval_threshold(e: Env, admin: Address, threshold: u32) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        Self::require_no_active_payroll_run(&e);
+
+        if threshold == 0 {
+            panic!("Approval threshold must be positive: use clear_approval_threshold to disable");
+        }
+        if threshold > MAX_APPROVAL_THRESHOLD {
+            panic!("Approval threshold exceeds the maximum supported value");
+        }
+        if threshold > Self::get_reviewer_count(e.clone()) {
+            panic!("Approval threshold exceeds the number of authorized reviewers");
+        }
+
+        let previous_ref = stored_ref(&e, &DataKey::ApprovalThreshold);
+        e.storage()
+            .persistent()
+            .set(&DataKey::ApprovalThreshold, &threshold);
+
+        payroll_events::emit_approval_threshold_set(&e, threshold);
+        record_config_change(
+            &e,
+            &admin,
+            config_keys::APPROVAL_THRESHOLD,
+            no_value_ref(&e),
+            previous_ref,
+            stored_ref(&e, &DataKey::ApprovalThreshold),
+        );
+    }
+
+    /// Remove the approval threshold, restoring the default workflow in
+    /// which finalization and direct execution need no approval quorum.
+    /// Only the admin may call; locked while any payroll run is pending.
+    pub fn clear_approval_threshold(e: Env, admin: Address) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        Self::require_no_active_payroll_run(&e);
+
+        let previous_ref = stored_ref(&e, &DataKey::ApprovalThreshold);
+        e.storage().persistent().remove(&DataKey::ApprovalThreshold);
+
+        payroll_events::emit_approval_threshold_set(&e, 0);
+        record_config_change(
+            &e,
+            &admin,
+            config_keys::APPROVAL_THRESHOLD,
+            no_value_ref(&e),
+            previous_ref,
+            stored_ref(&e, &DataKey::ApprovalThreshold),
+        );
+    }
+
+    /// Return the configured approval threshold, if any.
+    pub fn get_approval_threshold(e: Env) -> Option<u32> {
+        approvals::threshold(&e)
+    }
+
+    /// Return every approval recorded for a run, including approvals that no
+    /// longer count because they expired or their reviewer was revoked.
+    pub fn get_run_approvals(e: Env, run_id: u64) -> Vec<RunApproval> {
+        approvals::run_approvals(&e, run_id)
+    }
+
+    /// Return how many live approvals a run has against the configured
+    /// threshold. Contains counts only — no payroll amounts or identities.
+    pub fn get_approval_progress(e: Env, run_id: u64) -> ApprovalProgress {
+        approvals::progress(&e, run_id)
+    }
+
     // ── Issue #519: signed, expiring operator authorizations ────────────────
 
     /// Register (or replace) the ed25519 public key that signs off-chain
@@ -8075,12 +8162,18 @@ impl Payroll {
     }
 
     /// Approve a payroll run as an authorized reviewer.
+    ///
+    /// Each reviewer may hold at most one live approval per run; a repeated
+    /// approval is rejected rather than counted twice toward the approval
+    /// threshold.
     pub fn approve_payroll_run(e: Env, reviewer: Address, run_id: u64) {
         Self::require_not_paused(&e);
         if !Self::is_reviewer(e.clone(), reviewer.clone()) {
             panic!("Unauthorized: caller is not an authorized reviewer");
         }
         reviewer.require_auth();
+
+        approvals::record_approval(&e, run_id, &reviewer);
 
         let review = RunReview {
             run_id,
@@ -8096,13 +8189,16 @@ impl Payroll {
         payroll_events::emit_run_approved(&e, run_id, reviewer);
     }
 
-    /// Reject a payroll run as an authorized reviewer.
+    /// Reject a payroll run as an authorized reviewer. Clears every recorded
+    /// approval for the run.
     pub fn reject_payroll_run(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
         Self::require_not_paused(&e);
         if !Self::is_reviewer(e.clone(), reviewer.clone()) {
             panic!("Unauthorized: caller is not an authorized reviewer");
         }
         reviewer.require_auth();
+
+        approvals::clear_approvals(&e, run_id);
 
         let review = RunReview {
             run_id,
@@ -8118,13 +8214,16 @@ impl Payroll {
         payroll_events::emit_run_rejected(&e, run_id, reviewer, reason);
     }
 
-    /// Request changes to a payroll run as an authorized reviewer.
+    /// Request changes to a payroll run as an authorized reviewer. Clears
+    /// every recorded approval for the run.
     pub fn request_changes_payroll_run(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
         Self::require_not_paused(&e);
         if !Self::is_reviewer(e.clone(), reviewer.clone()) {
             panic!("Unauthorized: caller is not an authorized reviewer");
         }
         reviewer.require_auth();
+
+        approvals::clear_approvals(&e, run_id);
 
         let review = RunReview {
             run_id,
@@ -8144,6 +8243,125 @@ impl Payroll {
     pub fn get_run_review(e: Env, run_id: u64) -> Option<RunReview> {
         e.storage().persistent().get(&DataKey::RunReview(run_id))
     }
+
+    /// Withdraw a previously granted payroll run approval (issue #522).
+    ///
+    /// Only the reviewer that recorded the currently active `Approved`
+    /// decision may withdraw it, and a non-empty reason is mandatory. The
+    /// stored review transitions to `ReviewDecision::Withdrawn` so the audit
+    /// trail stays intact while expiry validation (#403) and any consumer
+    /// treating the run as approved no longer observe an active approval.
+    /// The withdrawn approval also stops counting toward the approval
+    /// threshold.
+    ///
+    /// Privacy-safe: events carry only the opaque run id, the withdrawing
+    /// reviewer, and the reason symbol — never salary values or employee
+    /// data.
+    ///
+    /// # Panics
+    /// * `"Invalid payroll run ID"` — reserved sentinel run id.
+    /// * `"Symbol cannot be empty"` — empty withdrawal reason.
+    /// * `"Unauthorized: caller is not an authorized reviewer"` — caller is
+    ///   not an authorized reviewer.
+    /// * `"Run review not found"` — no review exists for `run_id`.
+    /// * `"No active approval to withdraw"` — the stored review is not
+    ///   `Approved` (already withdrawn, rejected, or changes requested).
+    /// * `"Only the approving reviewer may withdraw an approval"` — a
+    ///   different reviewer attempted the withdrawal.
+    pub fn withdraw_approval(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
+        Self::validate_run_id(run_id);
+        Self::validate_symbol_not_empty(&e, &reason, "reason");
+        if !Self::is_reviewer(e.clone(), reviewer.clone()) {
+            panic!("Unauthorized: caller is not an authorized reviewer");
+        }
+        reviewer.require_auth();
+
+        let review: RunReview = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunReview(run_id))
+            .expect("Run review not found");
+        if review.decision != ReviewDecision::Approved {
+            panic!("No active approval to withdraw");
+        }
+        if review.reviewer != reviewer {
+            panic!("Only the approving reviewer may withdraw an approval");
+        }
+
+        let withdrawn = RunReview {
+            run_id,
+            reviewer: reviewer.clone(),
+            decision: ReviewDecision::Withdrawn,
+            reason: reason.clone(),
+            reviewed_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunReview(run_id), &withdrawn);
+        approvals::remove_approval(&e, run_id, &reviewer);
+
+        payroll_events::emit_run_approval_withdrawn(&e, run_id, reviewer, reason);
+    }
+
+    /// Supersede an existing payroll approval as a different authorized
+    /// reviewer (issue #522).
+    ///
+    /// The active approval must have been recorded by a *different*
+    /// reviewer; re-approving one's own approval is a no-op and rejected so
+    /// the supersession event always names a genuine handover. On success
+    /// the stored review is re-pointed at the new reviewer with a fresh
+    /// timestamp (which also restarts the #403 expiry window), and an audit
+    /// event names both the previous and the new reviewer so accountability
+    /// for the active approval is always explicit. The approval counted
+    /// toward the approval threshold moves to the new reviewer as well.
+    ///
+    /// # Panics
+    /// * `"Invalid payroll run ID"` — reserved sentinel run id.
+    /// * `"Unauthorized: caller is not an authorized reviewer"` — caller is
+    ///   not an authorized reviewer.
+    /// * `"Run review not found"` — no review exists for `run_id`.
+    /// * `"No active approval to supersede"` — the stored review is not
+    ///   `Approved`.
+    /// * `"Superseding reviewer must differ from the current approver"` —
+    ///   the current approver attempted to supersede themselves.
+    /// * `"Duplicate approval: reviewer has already approved this payroll run"`
+    ///   — the superseding reviewer already holds a live approval.
+    pub fn supersede_approval(e: Env, reviewer: Address, run_id: u64) {
+        Self::validate_run_id(run_id);
+        if !Self::is_reviewer(e.clone(), reviewer.clone()) {
+            panic!("Unauthorized: caller is not an authorized reviewer");
+        }
+        reviewer.require_auth();
+
+        let review: RunReview = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunReview(run_id))
+            .expect("Run review not found");
+        if review.decision != ReviewDecision::Approved {
+            panic!("No active approval to supersede");
+        }
+        if review.reviewer == reviewer {
+            panic!("Superseding reviewer must differ from the current approver");
+        }
+
+        approvals::remove_approval(&e, run_id, &review.reviewer);
+        approvals::record_approval(&e, run_id, &reviewer);
+
+        let superseding = RunReview {
+            run_id,
+            reviewer: reviewer.clone(),
+            decision: ReviewDecision::Approved,
+            reason: Symbol::new(&e, "approved"),
+            reviewed_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunReview(run_id), &superseding);
+
+        payroll_events::emit_run_approval_superseded(&e, run_id, review.reviewer, reviewer);
+    }
+
     /// Read contract dependency addresses configured during initialization.
     pub fn get_addresses(e: Env) -> ContractAddresses {
         e.storage()
@@ -8448,37 +8666,9 @@ impl Payroll {
             .get(&DataKey::ArchiveMarker(run_id))
     }
 
-    /// Validate that a period is suitable for cloning/templating.
-    ///
-    /// Checks:
-    /// - Period configuration is not frozen
-    /// - Settlement window exists
-    ///
-    /// Returns Ok(()) if valid, panics with actionable message otherwise.
-    /// Privacy-safe: does not expose salary amounts or employee data.
-    fn validate_period_for_cloning(e: Env, period: Symbol) -> Result<(), ()> {
-        Self::validate_symbol_not_empty(&e, &period, "period");
+    // ── Issue #402: Safe Treasury Balance Summary View ───────────────────────
 
-        // Check if period is frozen
-        if Self::is_period_config_frozen(e.clone(), period.clone()) {
-            panic!("Source period is frozen and cannot be used as a template");
-        }
-
-        // Verify settlement window exists
-        if !e
-            .storage()
-            .persistent()
-            .has(&DataKey::SettlementWindow(period.clone()))
-        {
-            panic!("Source period has no settlement window configured");
-        }
-
-        Ok(())
-    }
-
-    // ────────────────────────────────────────────────────────────    // Issue #512: Draft Checksum Verification Enhancement
-    // ────────────────────────────────────────────────────────────
-    /// Verify draft checksum matches between preparation and finalization.
+    /// Return aggregate treasury balance summary for a given asset token (#402).
     ///
     /// Returns the total balance held at the treasury address, the reserved/locked
     /// balance allocated to pending payroll runs, blocked balances, and the net
@@ -8488,11 +8678,23 @@ impl Payroll {
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
-            .get(&DataKey::PendingRun(run_id))
-            .expect("Pending run not found");
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
+        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
+        let blocked_balance = 0i128;
+        let available_balance = total_balance
+            .checked_sub(reserved_balance)
+            .unwrap_or(0i128)
+            .checked_sub(blocked_balance)
+            .unwrap_or(0i128);
 
-        if pending_run.draft_hash != provided_hash {
-            panic!("Draft checksum mismatch: payroll data was modified after review");
+        SafeTreasurySummary {
+            asset,
+            total_balance,
+            available_balance,
+            reserved_balance,
+            blocked_balance,
         }
     }
 
@@ -8555,7 +8757,19 @@ impl Payroll {
 
     // ?? Issue #403: Payroll Approval Expiry Validation ???????????????????????
 
-        Ok(())
+    /// Check whether an approval for a payroll run has expired (#403).
+    ///
+    /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
+    /// Returns `false` if the approval is within the validity window or if no approval exists.
+    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
+        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
+            if review.decision == ReviewDecision::Approved {
+                let current_time = e.ledger().timestamp();
+                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
+                return current_time > expiry_time;
+            }
+        }
+        false
     }
 
     /// Validate that a payroll run approval is active and not expired (#403).
